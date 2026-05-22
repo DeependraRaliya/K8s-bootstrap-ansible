@@ -18,6 +18,7 @@ The playbook was originally designed and tested on **2 RHEL 10 servers**:
 However, the automation was intentionally written with modularity and portability in mind, making several parts reusable across other Linux distributions with minimal modifications.
 
 Apart from the kubeadm-bootstrap.yaml, I had an inventory file that contains the host names and group names that this playbook uses to execute certain steps. I have shared the example inventory file in this readme file below, it's not exactly the same as the one I used in my environment. So before you can run this playbook, you need to create your own inventory file.
+
 ---
 
 # Motivation Behind This Project
