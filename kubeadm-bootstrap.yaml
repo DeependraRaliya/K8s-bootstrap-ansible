@@ -1,0 +1,449 @@
+---
+# k8s-calico-dashboard.yml
+# Installs Kubernetes on PROD01 (control plane) and PROD02 (worker) with Calico (10.244.0.0/16) and Dashboard.
+
+########################
+# Variables (tweak here)
+########################
+- hosts: k8s_all
+  gather_facts: yes
+  become: yes
+  vars:
+    pod_network_cidr: "10.244.0.0/16"
+
+    # Set a specific K8s major.minor for the repo (adjust as needed)
+    k8s_repo_series: "v1.30"
+
+    # If you want to pin package versions, set here (or leave blank to get latest in the chosen series)
+    kube_packages:
+      - kubelet
+      - kubeadm
+      - kubectl
+      - cri-tools
+      - kubernetes-cni
+
+    # Dashboard version (can update later)
+    dashboard_version: "v2.7.0"
+
+    # Whether to force SELinux permissive (common with kubeadm on RHEL-based)
+    force_selinux_permissive: true
+
+    # Path where we’ll stage manifests on the control plane
+    k8s_stage_dir: "/root/k8s-bootstrap"
+
+  tasks:
+    #####################################################
+    # Common prerequisites on ALL NODES (control + worker)
+    #####################################################
+    - name: Ensure required packages are present
+      package:
+        name:
+          - curl
+          - tar
+          - socat
+          - conntrack-tools
+          - ebtables
+          - ethtool
+          - iproute
+          - iptables
+          - ipset
+          - jq
+          - gnupg2
+          - rsync
+          - chrony
+        state: present
+
+    - name: Enable and start chronyd (time sync)
+      service:
+        name: chronyd
+        state: started
+        enabled: yes
+
+        
+    #################################################################
+    # Docker Compatibility — allow Docker + Kubernetes to coexist
+    #################################################################
+
+    # - name: Check if Docker is installed
+    #   command: which docker
+    #   register: docker_installed
+    #   ignore_errors: true
+
+    # - name: Read Docker info if installed
+    #   command: docker info --format '{{ .CgroupDriver }}'
+    #   register: docker_cgroup_driver
+    #   when: docker_installed.rc == 0
+    #   ignore_errors: true
+
+    # - name: Ensure Docker uses systemd cgroup driver (required for Kubernetes compatibility)
+    #   block:
+    #     - name: Create /etc/docker directory
+    #       file:
+    #         path: /etc/docker
+    #         state: directory
+
+    #     - name: Configure Docker daemon.json for systemd cgroups
+    #       copy:
+    #         dest: /etc/docker/daemon.json
+    #         mode: '0644'
+    #         content: |
+    #           {
+    #             "exec-opts": ["native.cgroupdriver=systemd"]
+    #           }
+
+    #     - name: Restart Docker to apply cgroup changes
+    #       service:
+    #         name: docker
+    #         state: restarted
+    #         enabled: yes
+    #   when:
+    #     - docker_installed.rc == 0
+    #     - docker_cgroup_driver.stdout != "systemd"
+
+    # - name: Check if Docker-installed containerd.io package exists (conflict source)
+    #   package_facts:
+    #   when: docker_installed.rc == 0
+
+    # - name: Fail if Docker containerd.io package conflicts with Kubernetes containerd
+    #   fail:
+    #     msg: >
+    #       Docker's containerd.io package is installed.
+    #       This conflicts with Kubernetes containerd.
+    #       Please uninstall containerd.io or install Docker using the OS repository method.
+    #   when:
+    #     - docker_installed.rc == 0
+    #     - "'containerd.io' in ansible_facts.packages"
+
+    
+    - name: Check if Docker is installed
+      command: which docker
+      register: docker_installed
+      ignore_errors: true
+      changed_when: false
+
+    - name: Read Docker cgroup driver if installed (no braces trick)
+      shell: "docker info | awk -F': ' '/Cgroup Driver/ {print $2}' | tr -d '[:space:]'"
+      register: docker_cgroup_driver
+      when: docker_installed.rc == 0
+      ignore_errors: true
+      changed_when: false
+
+    - name: Ensure Docker uses systemd cgroup driver (required for Kubernetes compatibility)
+      block:
+        - name: Create /etc/docker directory
+          file:
+            path: /etc/docker
+            state: directory
+
+        - name: Configure Docker daemon.json for systemd cgroups
+          copy:
+            dest: /etc/docker/daemon.json
+            mode: '0644'
+            content: |
+              {
+                "exec-opts": ["native.cgroupdriver=systemd"]
+              }
+
+        - name: Restart Docker to apply cgroup changes
+          service:
+            name: docker
+            state: restarted
+            enabled: yes
+      when:
+        - docker_installed.rc == 0
+        - docker_cgroup_driver is defined
+        - docker_cgroup_driver.rc is defined
+        - docker_cgroup_driver.rc == 0
+        - docker_cgroup_driver.stdout is defined
+        - docker_cgroup_driver.stdout != "systemd"
+
+
+
+    - name: Disable swap (runtime)
+      command: swapoff -a
+      when: ansible_swaptotal_mb | int > 0
+      changed_when: false
+
+    - name: Remove swap from /etc/fstab (persist)
+      replace:
+        path: /etc/fstab
+        regexp: '^\s*([^#]\S+)\s+\S+\s+swap\s+'
+        replace: '# \1 swap was disabled by Ansible for Kubernetes'
+      register: swap_fstab
+
+    - name: Set SELinux to permissive (recommended for kubeadm)
+      selinux:
+        policy: targeted
+        state: permissive
+      when: force_selinux_permissive
+
+    - name: Load kernel modules required by Kubernetes networking
+      copy:
+        dest: /etc/modules-load.d/k8s.conf
+        content: |
+          overlay
+          br_netfilter
+      notify: Load kernel modules
+
+    - name: Ensure sysctl settings for Kubernetes networking
+      copy:
+        dest: /etc/sysctl.d/99-kubernetes-cri.conf
+        content: |
+          net.bridge.bridge-nf-call-iptables  = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.ipv4.ip_forward                 = 1
+      notify: Apply sysctl
+
+    - name: Install containerd
+      package:
+        name: containerd
+        state: present
+
+    - name: Create containerd config directory
+      file:
+        path: /etc/containerd
+        state: directory
+        mode: '0755'
+
+    - name: Generate default containerd config if not exists
+      shell: |
+        test -f /etc/containerd/config.toml || (containerd config default > /etc/containerd/config.toml)
+      args:
+        creates: /etc/containerd/config.toml
+
+    - name: Configure containerd to use systemd cgroups
+      replace:
+        path: /etc/containerd/config.toml
+        regexp: 'SystemdCgroup\s*=\s*false'
+        replace: 'SystemdCgroup = true'
+      notify: Restart containerd
+
+    - name: Ensure pause image is set (helps airgapped or version skew)
+      lineinfile:
+        path: /etc/containerd/config.toml
+        regexp: '^\s*sandbox_image\s*='
+        line: '    sandbox_image = "registry.k8s.io/pause:3.9"'
+        insertafter: 'plugins."io.containerd.grpc.v1.cri".sandbox_image'
+      notify: Restart containerd
+      ignore_errors: true  # The scaffold differs across distros; safe to ignore
+
+    - name: Enable and start containerd
+      service:
+        name: containerd
+        state: started
+        enabled: yes
+
+    - name: Add Kubernetes repository (pkgs.k8s.io)
+      copy:
+        dest: /etc/yum.repos.d/kubernetes.repo
+        content: |
+          [kubernetes]
+          name=Kubernetes
+          baseurl=https://pkgs.k8s.io/core:/stable:/{{ k8s_repo_series }}/rpm/
+          enabled=1
+          gpgcheck=1
+          repo_gpgcheck=1
+          gpgkey=https://pkgs.k8s.io/core:/stable:/{{ k8s_repo_series }}/rpm/repodata/repomd.xml.key
+          exclude=kubelet kubeadm kubectl cri-tools kubernetes-cni
+      register: k8s_repo_added
+
+    - name: Install Kubernetes components (kubelet, kubeadm, kubectl, cri-tools, kubernetes-cni)
+      yum:
+        name: "{{ kube_packages }}"
+        state: present
+        disable_excludes: kubernetes
+
+    - name: Enable kubelet (will start after init/join)
+      service:
+        name: kubelet
+        enabled: yes
+
+  handlers:
+    - name: Load kernel modules
+      shell: |
+        modprobe overlay || true
+        modprobe br_netfilter || true
+
+    - name: Apply sysctl
+      command: sysctl --system
+
+    - name: Restart containerd
+      service:
+        name: containerd
+        state: restarted
+
+#############################
+# Initialize Control Plane
+#############################
+- hosts: control_plane
+  gather_facts: yes
+  become: yes
+  vars:
+    k8s_stage_dir: "/root/k8s-bootstrap"
+    pod_network_cidr: "10.244.0.0/16"
+    dashboard_version: "v2.7.0"
+  tasks:
+    - name: Create staging dir for control plane
+      file:
+        path: "{{ k8s_stage_dir }}"
+        state: directory
+        mode: '0700'
+
+    - name: Initialize Kubernetes control plane (kubeadm init)
+      command: >
+        kubeadm init
+        --pod-network-cidr={{ pod_network_cidr }}
+        --cri-socket unix:///run/containerd/containerd.sock
+      args:
+        creates: /etc/kubernetes/manifests/kube-apiserver.yaml
+      register: kubeadm_init
+
+    - name: Set up admin kubeconfig for root
+      shell: |
+        mkdir -p /root/.kube
+        cp -i /etc/kubernetes/admin.conf /root/.kube/config
+        chown root:root /root/.kube/config
+      args:
+        creates: /root/.kube/config
+
+    - name: Obtain join command for workers
+      command: kubeadm token create --print-join-command
+      register: join_cmd
+
+    - name: Save join command as a host fact (for worker play)
+      set_fact:
+        worker_join_command: "{{ join_cmd.stdout }} --cri-socket unix:///run/containerd/containerd.sock"
+
+    # ------- Install Calico with 10.244.0.0/16 -------
+    - name: Download Calico manifest
+      get_url:
+        url: https://raw.githubusercontent.com/projectcalico/calico/v3.27.3/manifests/calico.yaml
+        dest: "{{ k8s_stage_dir }}/calico.yaml"
+        mode: '0600'
+
+    - name: Set Calico Pod CIDR to {{ pod_network_cidr }}
+      replace:
+        path: "{{ k8s_stage_dir }}/calico.yaml"
+        regexp: '192\.168\.0\.0/16'
+        replace: '{{ pod_network_cidr }}'
+
+    - name: Apply Calico CNI
+      command: kubectl apply -f {{ k8s_stage_dir }}/calico.yaml
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: Wait for Calico pods to be Ready
+      shell: |
+        kubectl -n kube-system get pods -l k8s-app=calico-node --no-headers \
+        | awk '{print $3}' | grep -v Running && exit 1 || exit 0
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: calico_ready_check
+      retries: 30
+      delay: 10
+      until: calico_ready_check.rc == 0
+
+    # ------- Install Kubernetes Dashboard -------
+    - name: Deploy Kubernetes Dashboard
+      command: >
+        kubectl apply -f https://raw.githubusercontent.com/kubernetes/dashboard/{{ dashboard_version }}/aio/deploy/recommended.yaml
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: Create admin ServiceAccount for dashboard
+      copy:
+        dest: "{{ k8s_stage_dir }}/dashboard-admin.yaml"
+        mode: '0600'
+        content: |
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: admin-user
+            namespace: kubernetes-dashboard
+          ---
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRoleBinding
+          metadata:
+            name: admin-user-binding
+          subjects:
+          - kind: ServiceAccount
+            name: admin-user
+            namespace: kubernetes-dashboard
+          roleRef:
+            kind: ClusterRole
+            name: cluster-admin
+            apiGroup: rbac.authorization.k8s.io
+      register: dashboard_sa
+
+    - name: Apply dashboard admin ServiceAccount and binding
+      command: kubectl apply -f {{ k8s_stage_dir }}/dashboard-admin.yaml
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: Wait for dashboard pods to be Running
+      shell: |
+        kubectl -n kubernetes-dashboard get pods --no-headers \
+        | awk '{print $3}' | grep -v Running && exit 1 || exit 0
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: dash_ready_check
+      retries: 30
+      delay: 10
+      until: dash_ready_check.rc == 0
+
+    - name: Generate a dashboard login token (short-lived; re-run if needed)
+      command: kubectl -n kubernetes-dashboard create token admin-user
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: dashboard_token
+
+    - name: Show dashboard access info
+      debug:
+        msg:
+          - "Kubernetes Dashboard is deployed."
+          - "Recommended access (secure, localhost only):"
+          - "  1) On the control-plane node, run:"
+          - "     kubectl proxy --address=127.0.0.1 --accept-hosts='^127\\.0\\.0\\.1$' &"
+          - "  2) On your laptop/desktop, open an SSH tunnel:"
+          - "     ssh -L 8001:127.0.0.1:8001 <USER>@<CONTROL_PLANE_IP>"
+          - "  3) Then open this URL locally:"
+          - "     http://localhost:8001/api/v1/namespaces/kubernetes-dashboard/services/https:kubernetes-dashboard:/proxy/"
+          - "Use this token to log in (valid for a limited time):"
+          - "{{ dashboard_token.stdout }}"
+
+
+#######################################
+# Join the worker node(s) to the cluster
+#######################################
+- hosts: workers
+  gather_facts: yes
+  become: yes
+  vars:
+    # reference control plane host (first host in group)
+    cp_host: "{{ groups['control_plane'][0] }}"
+  tasks:
+    # - name: Retrieve join command from control plane hostvars
+    #   set_fact:
+    #     join_cmd: "{{ worker_join_command }}"
+        
+    - name: Fetch join command from control-plane node
+      set_fact:
+          worker_join_command: "{{ lookup('file', '/home/deependra/kubernetes/kubernetes-var.txt') }}"
+      delegate_to: "{{ groups['control_plane'][0] }}"
+      run_once: true
+
+    - name: Set join_cmd locally
+      set_fact:
+        join_cmd: "{{ worker_join_command }}"
+
+    - name: Join the node to the cluster
+      # command: "{{ join_cmd }}"
+      ansible.builtin.shell: "{{ join_cmd }}"
+      args:
+        creates: /etc/kubernetes/kubelet.conf
+
+    - name: Ensure kubelet is running
+      service:
+        name: kubelet
+        state: started
+        enabled: yes
